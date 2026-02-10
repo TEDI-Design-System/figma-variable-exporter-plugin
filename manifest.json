@@ -1,0 +1,20 @@
+{
+  "name": "TEDI Figma Variable exporter",
+  "id": "1601504191543761945",
+  "api": "1.0.0",
+  "main": "code.js",
+  "capabilities": [
+    "inspect"
+  ],
+  "enableProposedApi": false,
+  "documentAccess": "dynamic-page",
+  "editorType": [
+    "dev"
+  ],
+  "ui": "ui.html",
+  "networkAccess": {
+    "allowedDomains": [
+      "https://cdnjs.cloudflare.com"
+    ]
+  }
+}

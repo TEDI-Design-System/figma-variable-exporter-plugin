@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: sans-serif; padding: 20px; margin: 0; background: #f5f5f5; }
+    h1 { margin: 0 0 16px; font-size: 20px; }
+    select, input { width: 100%; padding: 10px; margin: 8px 0 12px; font-size: 16px; }
+    h2 { margin: 32px 0 12px; font-size: 18px; }
+    h3 { margin: 16px 0 8px; color: #444; font-size: 15px; }
+    .variable { display: flex; align-items: center; margin: 6px 0; font-size: 13px; }
+    .swatch { width: 18px; height: 18px; margin-right: 10px; border: 1px solid #ddd; border-radius: 4px; }
+    button { font-size: 16px; cursor: pointer; height: 2.5rem; }
+    #export { background: #308653; color: #fff; border: none; border-radius: 22.5rem; padding: 0.5rem 1.125rem; }
+    #export-all { background: #005aa3; color: #fff; border: none; border-radius: 22.5rem; padding: 0.5rem 1.125rem; }
+    #cancel { background: #fff; border: 1px solid #9293a4; border-radius: 22.5rem; color: #005aa3; padding: 0.5rem 1.125rem; }
+    .section { margin-bottom: 32px; }
+    .empty { color: #888; font-style: italic; }
+    #loading { text-align: center; padding: 40px; color: #838494; }
+    .input { padding: 0.5rem; border: 1px solid #838494; border-radius: 0.25rem; height: 2.5rem; }
+    .input:focus, .input:active { border-color: #005aa3; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+  <h1>Export TEDI variables</h1>
+  <hr/>
+
+  <label for="themeName">Theme name: <span style="color: #ac3232">*</span></label>
+  <input id="themeName" placeholder="Enter theme name" class="input" />
+
+  <div style="margin-top: 24px;">
+    <button id="export-all">Export all</button>
+    <button id="cancel">Cancel</button>
+  </div>
+
+  <script>
+    const themeInput = document.getElementById('themeName');
+    const loading = document.getElementById('loading');
+    const content = document.getElementById('content');
+
+    let currentData = null;
+
+    const kebab = str =>
+      str.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
+    const triggerDownload = (filename, content) => {
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+
+      document.body.appendChild(a);
+
+      requestAnimationFrame(() => {
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+        }, 100);
+      });
+    };
+
+    const triggerZipDownload = async (files, themeName) => {
+      const zip = new JSZip();
+      files.forEach(f => zip.file(f.name, f.content));
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${kebab(themeName)}-all-modes.zip`;
+
+      document.body.appendChild(a);
+
+      requestAnimationFrame(() => {
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+        }, 100);
+      });
+    };
+
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      else if (msg.type === 'download-multiple') {
+        msg.files.forEach(f => triggerDownload(f.name, f.content));
+      }
+
+      else if (msg.type === 'zip-download') {
+        triggerZipDownload(msg.files, msg.themeName);
+      }
+    };
+
+    document.getElementById('export-all').onclick = () => {
+      const themeName = themeInput.value.trim();
+      if (!themeName) return alert('Please enter a theme name');
+
+      parent.postMessage({
+        pluginMessage: { type: 'export-all', themeName }
+      }, '*');
+    };
+
+    document.getElementById('cancel').onclick = () => {
+      parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');
+    };
+  </script>
+</body>
+</html>
