@@ -1,6 +1,6 @@
 {
   "name": "TEDI Figma Variable exporter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Plugin that exports TEDI variable overrides",
   "main": "code.js",
   "scripts": {

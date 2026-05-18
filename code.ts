@@ -24,8 +24,8 @@ async function exportVariablesToCss() {
 
   const MEDIA_QUERIES: Record<ModeBucket, string | null> = {
     desktop: null,
-    tablet: '(max-width: 62rem)',
-    mobile: '(max-width: 48rem)',
+    tablet: '(width < 62rem)',
+    mobile: '(width < 48rem)',
   };
 
   const modeToBucket = (modeName: string): ModeBucket | null => {
@@ -47,7 +47,8 @@ async function exportVariablesToCss() {
 
   const isBaseMode = (modeName: string) => {
     const n = modeName.toLowerCase();
-    return n.includes('mode 1') || n.includes('default');
+    if (n.includes('mode 1') || n.includes('default')) return true;
+    return modeToScheme(modeName) === null && modeToBucket(modeName) === null;
   };
 
   function isVariableAlias(value: VariableValue): value is VariableAlias {
@@ -114,6 +115,136 @@ async function exportVariablesToCss() {
 
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
 
+  const TEDI_SOURCE_NAMES = [
+    'TEDI colors base',
+    'TEDI colors semantic',
+    'TEDI dimensions base',
+    'TEDI dimensions semantic',
+    'TEDI fonts base',
+    'TEDI fonts semantic',
+  ];
+
+  // Normalize collection names so "TEDI Colors Base", "tedi/colors/base", "TEDI - Colors - Base"
+  // all compare equal. Case + separator variations are common in Figma.
+  const normCollName = (s: string) =>
+    s.trim().toLowerCase().replace(/[\s\-_/]+/g, ' ').replace(/\s+/g, ' ');
+
+  const TEDI_SOURCE_NAMES_NORM = TEDI_SOURCE_NAMES.map(normCollName);
+
+  const isTediSource = (name: string) =>
+    TEDI_SOURCE_NAMES_NORM.includes(normCollName(name));
+  const isTediBaseLayer = (name: string) =>
+    /\bbase$/.test(normCollName(name));
+  const isTediSemanticLayer = (name: string) =>
+    /\bsemantic$/.test(normCollName(name));
+  const isTediDimensionsSource = (name: string) =>
+    normCollName(name).includes('dimensions');
+
+  const libraryVarSources = new Map<string, string>();
+  try {
+    const libCollections =
+      (await (figma as any).teamLibrary?.getAvailableLibraryVariableCollectionsAsync?.()) ?? [];
+    for (const lib of libCollections) {
+      if (!isTediSource(lib.name)) continue;
+      const libVars =
+        (await (figma as any).teamLibrary?.getVariablesInLibraryCollectionAsync?.(lib.key)) ?? [];
+      for (const lv of libVars) {
+        libraryVarSources.set(lv.name.toLowerCase(), lib.name.trim());
+      }
+    }
+  } catch {
+    // teamLibrary unavailable (e.g., permission missing) — fall through to alias-voting.
+  }
+
+  async function getSourceCollectionName(coll: VariableCollection): Promise<string | null> {
+    if (!('variableOverrides' in coll)) return null;
+
+    const localNorm = normCollName(coll.name);
+    const directMatch = TEDI_SOURCE_NAMES.find(s => normCollName(s) === localNorm);
+    if (directMatch) return directMatch;
+    const containsMatch = TEDI_SOURCE_NAMES.find(s => localNorm.includes(normCollName(s)));
+    if (containsMatch) return containsMatch;
+
+    if (libraryVarSources.size) {
+      const counts = new Map<string, number>();
+      for (const varId of coll.variableIds) {
+        const v = await figma.variables.getVariableByIdAsync(varId);
+        if (!v) continue;
+        const src = libraryVarSources.get(v.name.toLowerCase());
+        if (!src) continue;
+        counts.set(src, (counts.get(src) ?? 0) + 1);
+      }
+      if (counts.size) {
+        return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0][0];
+      }
+    }
+
+    const overrides = (coll as any).variableOverrides ?? {};
+    const sameNameCounts = new Map<string, number>();
+    const anyCounts = new Map<string, number>();
+
+    for (const varId of coll.variableIds) {
+      const v = await figma.variables.getVariableByIdAsync(varId);
+      if (!v) continue;
+      for (const modeId of Object.keys(v.valuesByMode)) {
+        if (overrides[varId]?.[modeId] !== undefined) continue;
+        const raw = v.valuesByMode[modeId];
+        if (!isVariableAlias(raw)) continue;
+        const target = await figma.variables.getVariableByIdAsync(raw.id);
+        if (!target) continue;
+        const targetColl = await figma.variables.getVariableCollectionByIdAsync(
+          target.variableCollectionId
+        );
+        if (!targetColl || !targetColl.remote) continue;
+        const name = targetColl.name.trim();
+        anyCounts.set(name, (anyCounts.get(name) ?? 0) + 1);
+        if (target.name === v.name) {
+          sameNameCounts.set(name, (sameNameCounts.get(name) ?? 0) + 1);
+        }
+      }
+    }
+
+    const pickFromCounts = (m: Map<string, number>): string | null => {
+      if (!m.size) return null;
+      const entries = Array.from(m.entries());
+      const semantic = entries.find(([n]) => isTediSemanticLayer(n));
+      if (semantic) return semantic[0];
+      return entries.sort((a, b) => b[1] - a[1])[0][0];
+    };
+
+    return pickFromCounts(sameNameCounts) ?? pickFromCounts(anyCounts);
+  }
+
+  const sourceNameByCollName: Record<string, string | null> = {};
+  for (const coll of collections) {
+    sourceNameByCollName[coll.name.trim()] = await getSourceCollectionName(coll);
+  }
+
+  async function getFreshSourceValue(
+    variable: Variable,
+    localMode: { modeId: string; name: string }
+  ): Promise<VariableValue | null> {
+    const localRaw = variable.valuesByMode[localMode.modeId] ?? null;
+    if (!localRaw || !isVariableAlias(localRaw)) return null;
+
+    const sourceVar = await figma.variables.getVariableByIdAsync(localRaw.id);
+    if (!sourceVar) return null;
+
+    const sourceColl = await figma.variables.getVariableCollectionByIdAsync(
+      sourceVar.variableCollectionId
+    );
+    if (!sourceColl) return null;
+
+    const localModeKey = localMode.name.trim().toLowerCase();
+    const matchedMode =
+      sourceColl.modes.find(m => m.name.trim().toLowerCase() === localModeKey) ??
+      sourceColl.modes.find(m => isBaseMode(m.name)) ??
+      sourceColl.modes[0];
+    if (!matchedMode) return null;
+
+    return sourceVar.valuesByMode[matchedMode.modeId] ?? null;
+  }
+
   const dataByMode: Record<
     string,
     Record<string, { primitives: Record<string,string>; overrides: Record<string,string> }>
@@ -122,6 +253,9 @@ async function exportVariablesToCss() {
   for (const coll of collections) {
     const collName = coll.name.trim();
     const isExtended = 'variableOverrides' in coll;
+    const sourceName = sourceNameByCollName[collName];
+
+    if (!isExtended || !sourceName || !isTediSource(sourceName)) continue;
 
     for (const mode of coll.modes) {
       const modeName = mode.name.trim();
@@ -132,16 +266,18 @@ async function exportVariablesToCss() {
         const variable = await figma.variables.getVariableByIdAsync(varId);
         if (!variable) continue;
 
-        const valuesByMode = isExtended
-          ? await variable.valuesByModeForCollectionAsync(coll)
-          : variable.valuesByMode;
-
-        const rawValue = valuesByMode[mode.modeId] ?? null;
-        if (!rawValue) continue;
-
         const isOverride =
-          isExtended &&
           (coll as any).variableOverrides?.[varId]?.[mode.modeId] !== undefined;
+
+        let rawValue: VariableValue | null = null;
+        if (!isOverride) {
+          rawValue = await getFreshSourceValue(variable, mode);
+        }
+        if (!rawValue) {
+          const valuesByMode = await variable.valuesByModeForCollectionAsync(coll);
+          rawValue = valuesByMode[mode.modeId] ?? null;
+        }
+        if (!rawValue) continue;
 
         const resolved = await resolveValue(
           rawValue,
@@ -162,6 +298,16 @@ async function exportVariablesToCss() {
     }
   }
 
+  const isDimensionCollection = (collName: string) => {
+    const src = sourceNameByCollName[collName];
+    return src ? isTediDimensionsSource(src) : false;
+  };
+
+  const isSemanticCollection = (collName: string) => {
+    const src = sourceNameByCollName[collName];
+    return src ? isTediSemanticLayer(src) : false;
+  };
+
   const buildSchemeLines = (scheme: ColorScheme) => {
     const vars = new Map<string,string>();
 
@@ -169,8 +315,10 @@ async function exportVariablesToCss() {
       if (!isBaseMode(modeName)) continue;
 
       for (const [collName, group] of Object.entries(collections)) {
-        if (includesAny(collName.toLowerCase(), COLL_DIM_KEYWORDS)) continue;
+        if (!isSemanticCollection(collName)) continue;
+        if (isDimensionCollection(collName)) continue;
         Object.entries(group.primitives).forEach(([k,v]) => vars.set(k,v));
+        Object.entries(group.overrides).forEach(([k,v]) => vars.set(k,v));
       }
     }
 
@@ -178,7 +326,8 @@ async function exportVariablesToCss() {
       if (modeToScheme(modeName) !== scheme) continue;
 
       for (const [collName, group] of Object.entries(collections)) {
-        if (includesAny(collName.toLowerCase(), COLL_DIM_KEYWORDS)) continue;
+        if (!isSemanticCollection(collName)) continue;
+        if (isDimensionCollection(collName)) continue;
         Object.entries(group.primitives).forEach(([k,v]) => vars.set(k,v));
         Object.entries(group.overrides).forEach(([k,v]) => vars.set(k,v));
       }
@@ -198,6 +347,99 @@ ${lines.join('\n')}
 `
   });
 
+  const buildBaseOverridesFile = (theme: string) => {
+    const colorLight = new Map<string,string>();
+    const colorDark = new Map<string,string>();
+    const dimDesktop = new Map<string,string>();
+    const dimTablet = new Map<string,string>();
+    const dimMobile = new Map<string,string>();
+
+    const mergeInto = (target: Map<string,string>, group: { primitives: Record<string,string>; overrides: Record<string,string> }) => {
+      Object.entries(group.primitives).forEach(([k,v]) => target.set(k,v));
+      Object.entries(group.overrides).forEach(([k,v]) => target.set(k,v));
+    };
+
+    for (const [modeName, collections] of Object.entries(dataByMode)) {
+      if (!isBaseMode(modeName)) continue;
+      for (const [collName, group] of Object.entries(collections)) {
+        const src = sourceNameByCollName[collName];
+        if (!src || !isTediBaseLayer(src)) continue;
+
+        if (isTediDimensionsSource(src)) {
+          mergeInto(dimDesktop, group);
+        } else {
+          mergeInto(colorLight, group);
+          mergeInto(colorDark, group);
+        }
+      }
+    }
+
+    for (const [modeName, collections] of Object.entries(dataByMode)) {
+      const scheme = modeToScheme(modeName);
+      const bucket = modeToBucket(modeName);
+      for (const [collName, group] of Object.entries(collections)) {
+        const src = sourceNameByCollName[collName];
+        if (!src || !isTediBaseLayer(src)) continue;
+
+        if (isTediDimensionsSource(src)) {
+          if (bucket === 'desktop') mergeInto(dimDesktop, group);
+          else if (bucket === 'tablet') mergeInto(dimTablet, group);
+          else if (bucket === 'mobile') mergeInto(dimMobile, group);
+        } else {
+          if (scheme === 'light') mergeInto(colorLight, group);
+          else if (scheme === 'dark') mergeInto(colorDark, group);
+        }
+      }
+    }
+
+    const toLines = (m: Map<string,string>) =>
+      Array.from(m.entries()).map(([k,v]) => `  --${kebab(k)}: ${v};`);
+
+    const colorLightLines = toLines(colorLight);
+    const colorDarkLines = toLines(colorDark);
+    const dimDesktopLines = toLines(dimDesktop);
+    const dimTabletLines = toLines(dimTablet);
+    const dimMobileLines = toLines(dimMobile);
+
+    const total =
+      colorLightLines.length + colorDarkLines.length +
+      dimDesktopLines.length + dimTabletLines.length + dimMobileLines.length;
+    if (!total) return null;
+
+    const themeKebab = kebab(theme);
+    let css = '';
+
+    if (colorLightLines.length || dimDesktopLines.length) {
+      css += `.tedi-theme--${themeKebab} {
+${[...colorLightLines, ...dimDesktopLines].join('\n')}
+}
+`;
+    }
+    if (colorDarkLines.length) {
+      css += `.tedi-theme--${themeKebab}-dark {
+${colorDarkLines.join('\n')}
+}
+`;
+    }
+    (['tablet','mobile'] as ModeBucket[]).forEach(b => {
+      const media = MEDIA_QUERIES[b];
+      const lines = b === 'tablet' ? dimTabletLines : dimMobileLines;
+      if (!media || !lines.length) return;
+      css += `
+@media ${media} {
+  .tedi-theme--${themeKebab} {
+${lines.join('\n')}
+  }
+}
+`;
+    });
+
+    return {
+      name: `_base-variables__${themeKebab}.css`,
+      content: css,
+    };
+  };
+
   const buildResponsiveDimensionsFile = (theme: string) => {
     const buckets: Record<ModeBucket, string[]> = {
       desktop: [],
@@ -210,15 +452,17 @@ ${lines.join('\n')}
       if (!bucket) continue;
 
       for (const [collName, group] of Object.entries(collections)) {
-        if (!includesAny(collName.toLowerCase(), COLL_DIM_KEYWORDS)) continue;
+        if (!isSemanticCollection(collName)) continue;
+        if (!isDimensionCollection(collName)) continue;
 
         Object.entries(group.primitives).forEach(([k,v]) => {
           buckets[bucket].push(`    --${kebab(k)}: ${v};`);
         });
       }
-      
+
       for (const [collName, group] of Object.entries(collections)) {
-        if (!includesAny(collName.toLowerCase(), COLL_DIM_KEYWORDS)) continue;
+        if (!isSemanticCollection(collName)) continue;
+        if (!isDimensionCollection(collName)) continue;
 
         Object.entries(group.overrides).forEach(([k,v]) => {
           buckets[bucket].push(`    --${kebab(k)}: ${v};`);
@@ -260,6 +504,9 @@ ${lines.join('\n')}
 
     if (msg.type === 'export-all') {
       const files: { name:string; content:string }[] = [];
+
+      const baseFile = buildBaseOverridesFile(themeName);
+      if (baseFile) files.push(baseFile);
 
       (['light','dark'] as ColorScheme[]).forEach(scheme => {
         const lines = buildSchemeLines(scheme);
