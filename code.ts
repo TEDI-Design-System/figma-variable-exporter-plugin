@@ -124,8 +124,6 @@ async function exportVariablesToCss() {
     'TEDI fonts semantic',
   ];
 
-  // Normalize collection names so "TEDI Colors Base", "tedi/colors/base", "TEDI - Colors - Base"
-  // all compare equal. Case + separator variations are common in Figma.
   const normCollName = (s: string) =>
     s.trim().toLowerCase().replace(/[\s\-_/]+/g, ' ').replace(/\s+/g, ' ');
 
@@ -152,7 +150,7 @@ async function exportVariablesToCss() {
         libraryVarSources.set(lv.name.toLowerCase(), lib.name.trim());
       }
     }
-  } catch {
+  } catch (_e) {
     // teamLibrary unavailable (e.g., permission missing) — fall through to alias-voting.
   }
 
