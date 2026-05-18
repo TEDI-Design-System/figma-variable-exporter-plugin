@@ -6,6 +6,9 @@
   "capabilities": [
     "inspect"
   ],
+  "permissions": [
+    "teamlibrary"
+  ],
   "enableProposedApi": false,
   "documentAccess": "dynamic-page",
   "editorType": [
