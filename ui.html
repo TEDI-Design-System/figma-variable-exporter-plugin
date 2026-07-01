@@ -19,6 +19,14 @@
     #loading { text-align: center; padding: 40px; color: #838494; }
     .input { padding: 0.5rem; border: 1px solid #838494; border-radius: 0.25rem; height: 2.5rem; }
     .input:focus, .input:active { border-color: #005aa3; }
+    #collections {
+      max-height: 280px; overflow-y: auto;
+      border: 1px solid #d7d8e0; border-radius: 0.25rem;
+      padding: 8px; margin: 8px 0 12px; background: #fff;
+    }
+    .collection { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 14px; cursor: pointer; }
+    .collection input { width: auto; margin: 0; }
+    .collection .tag { color: #005aa3; font-size: 12px; }
   </style>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -29,6 +37,17 @@
 
   <label for="themeName">Theme name: <span style="color: #ac3232">*</span></label>
   <input id="themeName" placeholder="Enter theme name" class="input" />
+  <p class="empty" style="margin: 4px 0 0;">
+    Names the exported files, CSS classes and ZIP. Entering <code>my-theme</code> produces
+    <code>_base-variables__my-theme.css</code> and a <code>.tedi-theme--my-theme</code> class.
+  </p>
+
+  <div id="additional-section" style="display: none;">
+    <hr style="margin: 24px 0;" />
+    <label>Additional collections to export:</label>
+    <p class="empty" style="margin: 4px 0 0;">TEDI collections are always exported. Tick any extra collections to include.</p>
+    <div id="collections"></div>
+  </div>
 
   <div style="margin-top: 24px;">
     <button id="export-all">Export all</button>
@@ -37,10 +56,36 @@
 
   <script>
     const themeInput = document.getElementById('themeName');
-    const loading = document.getElementById('loading');
-    const content = document.getElementById('content');
+    const collectionsEl = document.getElementById('collections');
 
-    let currentData = null;
+    const renderCollections = (list) => {
+      const section = document.getElementById('additional-section');
+      collectionsEl.innerHTML = '';
+      if (!list || !list.length) {
+        section.style.display = 'none';
+        return;
+      }
+      section.style.display = 'block';
+      list.forEach((c) => {
+        const label = document.createElement('label');
+        label.className = 'collection';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = c.name;
+
+        const name = document.createElement('span');
+        name.textContent = c.name;
+
+        label.appendChild(cb);
+        label.appendChild(name);
+        collectionsEl.appendChild(label);
+      });
+    };
+
+    const getSelectedCollections = () =>
+      Array.from(collectionsEl.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((cb) => cb.value);
 
     const kebab = str =>
       str.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
@@ -89,6 +134,10 @@
       const msg = event.data.pluginMessage;
       if (!msg) return;
 
+      if (msg.type === 'collections') {
+        renderCollections(msg.collections);
+      }
+
       else if (msg.type === 'download-multiple') {
         msg.files.forEach(f => triggerDownload(f.name, f.content));
       }
@@ -103,9 +152,12 @@
       if (!themeName) return alert('Please enter a theme name');
 
       parent.postMessage({
-        pluginMessage: { type: 'export-all', themeName }
+        pluginMessage: { type: 'export-all', themeName, selected: getSelectedCollections() }
       }, '*');
     };
+
+    // Ask the plugin for the list of variable collections once the UI is ready.
+    parent.postMessage({ pluginMessage: { type: 'ui-ready' } }, '*');
 
     document.getElementById('cancel').onclick = () => {
       parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');

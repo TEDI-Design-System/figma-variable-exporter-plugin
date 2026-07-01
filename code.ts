@@ -139,6 +139,13 @@ async function exportVariablesToCss() {
     normCollName(name).includes('dimensions');
 
   const libraryVarSources = new Map<string, string>();
+  // Lower-cased set of the CURRENT (live) variable names for each TEDI source
+  // collection, keyed by normalized source name. The team-library API returns only
+  // live variables — soft-deleted "ghost" variables (left behind by renames such as
+  // adding the TEDI/ group) are excluded — so this set is our source of truth for
+  // filtering ghosts out of extended collections. Empty when teamLibrary is
+  // unavailable, in which case collectData falls back to a name-prefix heuristic.
+  const liveNamesBySource = new Map<string, Set<string>>();
   try {
     const libCollections =
       (await (figma as any).teamLibrary?.getAvailableLibraryVariableCollectionsAsync?.()) ?? [];
@@ -146,71 +153,97 @@ async function exportVariablesToCss() {
       if (!isTediSource(lib.name)) continue;
       const libVars =
         (await (figma as any).teamLibrary?.getVariablesInLibraryCollectionAsync?.(lib.key)) ?? [];
+      const liveSet = liveNamesBySource.get(normCollName(lib.name)) ?? new Set<string>();
       for (const lv of libVars) {
         libraryVarSources.set(lv.name.toLowerCase(), lib.name.trim());
+        liveSet.add(lv.name.toLowerCase());
       }
+      liveNamesBySource.set(normCollName(lib.name), liveSet);
     }
   } catch (_e) {
     // teamLibrary unavailable (e.g., permission missing) — fall through to alias-voting.
   }
 
-  async function getSourceCollectionName(coll: VariableCollection): Promise<string | null> {
-    if (!('variableOverrides' in coll)) return null;
+  // For collections that don't map to a known TEDI source (e.g. a project's own
+  // "RMK Base Colours Only"), synthesize a source label from the collection's own
+  // name so the rest of the pipeline can classify it by layer + category. The label
+  // deliberately mirrors the TEDI naming convention ("<category> <layer>") so the
+  // isTedi*Layer / isTediDimensionsSource helpers work on it unchanged.
+  const synthSourceLabel = (coll: VariableCollection): string => {
+    const n = normCollName(coll.name);
+    const layer = /\bsemantic\b/.test(n) ? 'semantic' : 'base';
+    const category =
+      /(dimension|spacing|\bspace\b|sizing|\bsize\b|radius|layout|grid)/.test(n) ? 'dimensions'
+      : /(font|typograph|text)/.test(n) ? 'fonts'
+      : 'colors';
+    return `${category} ${layer}`;
+  };
 
+  async function getSourceCollectionName(coll: VariableCollection): Promise<string | null> {
     const localNorm = normCollName(coll.name);
     const directMatch = TEDI_SOURCE_NAMES.find(s => normCollName(s) === localNorm);
     if (directMatch) return directMatch;
     const containsMatch = TEDI_SOURCE_NAMES.find(s => localNorm.includes(normCollName(s)));
     if (containsMatch) return containsMatch;
 
-    if (libraryVarSources.size) {
-      const counts = new Map<string, number>();
+    // Alias-based detection only works for extended collections (which override a
+    // library source). Standalone collections fall straight through to synthesis.
+    if ('variableOverrides' in coll) {
+      if (libraryVarSources.size) {
+        const counts = new Map<string, number>();
+        for (const varId of coll.variableIds) {
+          const v = await figma.variables.getVariableByIdAsync(varId);
+          if (!v) continue;
+          const src = libraryVarSources.get(v.name.toLowerCase());
+          if (!src) continue;
+          counts.set(src, (counts.get(src) ?? 0) + 1);
+        }
+        if (counts.size) {
+          // libraryVarSources only holds TEDI sources, so this is always a TEDI match.
+          return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0][0];
+        }
+      }
+
+      const overrides = (coll as any).variableOverrides ?? {};
+      const sameNameCounts = new Map<string, number>();
+      const anyCounts = new Map<string, number>();
+
       for (const varId of coll.variableIds) {
         const v = await figma.variables.getVariableByIdAsync(varId);
         if (!v) continue;
-        const src = libraryVarSources.get(v.name.toLowerCase());
-        if (!src) continue;
-        counts.set(src, (counts.get(src) ?? 0) + 1);
-      }
-      if (counts.size) {
-        return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0][0];
-      }
-    }
-
-    const overrides = (coll as any).variableOverrides ?? {};
-    const sameNameCounts = new Map<string, number>();
-    const anyCounts = new Map<string, number>();
-
-    for (const varId of coll.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(varId);
-      if (!v) continue;
-      for (const modeId of Object.keys(v.valuesByMode)) {
-        if (overrides[varId]?.[modeId] !== undefined) continue;
-        const raw = v.valuesByMode[modeId];
-        if (!isVariableAlias(raw)) continue;
-        const target = await figma.variables.getVariableByIdAsync(raw.id);
-        if (!target) continue;
-        const targetColl = await figma.variables.getVariableCollectionByIdAsync(
-          target.variableCollectionId
-        );
-        if (!targetColl || !targetColl.remote) continue;
-        const name = targetColl.name.trim();
-        anyCounts.set(name, (anyCounts.get(name) ?? 0) + 1);
-        if (target.name === v.name) {
-          sameNameCounts.set(name, (sameNameCounts.get(name) ?? 0) + 1);
+        for (const modeId of Object.keys(v.valuesByMode)) {
+          if (overrides[varId]?.[modeId] !== undefined) continue;
+          const raw = v.valuesByMode[modeId];
+          if (!isVariableAlias(raw)) continue;
+          const target = await figma.variables.getVariableByIdAsync(raw.id);
+          if (!target) continue;
+          const targetColl = await figma.variables.getVariableCollectionByIdAsync(
+            target.variableCollectionId
+          );
+          if (!targetColl || !targetColl.remote) continue;
+          const name = targetColl.name.trim();
+          anyCounts.set(name, (anyCounts.get(name) ?? 0) + 1);
+          if (target.name === v.name) {
+            sameNameCounts.set(name, (sameNameCounts.get(name) ?? 0) + 1);
+          }
         }
       }
+
+      const pickFromCounts = (m: Map<string, number>): string | null => {
+        if (!m.size) return null;
+        const entries = Array.from(m.entries());
+        const semantic = entries.find(([n]) => isTediSemanticLayer(n));
+        if (semantic) return semantic[0];
+        return entries.sort((a, b) => b[1] - a[1])[0][0];
+      };
+
+      // Only trust alias-voting when it resolves to a real TEDI source; otherwise
+      // classify from the collection's own name below.
+      const voted = pickFromCounts(sameNameCounts) ?? pickFromCounts(anyCounts);
+      if (voted && isTediSource(voted)) return voted;
     }
 
-    const pickFromCounts = (m: Map<string, number>): string | null => {
-      if (!m.size) return null;
-      const entries = Array.from(m.entries());
-      const semantic = entries.find(([n]) => isTediSemanticLayer(n));
-      if (semantic) return semantic[0];
-      return entries.sort((a, b) => b[1] - a[1])[0][0];
-    };
-
-    return pickFromCounts(sameNameCounts) ?? pickFromCounts(anyCounts);
+    return synthSourceLabel(coll);
   }
 
   const sourceNameByCollName: Record<string, string | null> = {};
@@ -248,50 +281,99 @@ async function exportVariablesToCss() {
     Record<string, { primitives: Record<string,string>; overrides: Record<string,string> }>
   > = {};
 
-  for (const coll of collections) {
-    const collName = coll.name.trim();
-    const isExtended = 'variableOverrides' in coll;
-    const sourceName = sourceNameByCollName[collName];
+  // Resolve variable values for the user-selected collections into dataByMode.
+  // Runs at export time (not load) so only the chosen collections are processed.
+  async function collectData(selected: Set<string>) {
+    for (const key of Object.keys(dataByMode)) delete dataByMode[key];
 
-    if (!isExtended || !sourceName || !isTediSource(sourceName)) continue;
+    for (const coll of collections) {
+      const collName = coll.name.trim();
+      if (!selected.has(collName)) continue;
 
-    for (const mode of coll.modes) {
-      const modeName = mode.name.trim();
-      dataByMode[modeName] ??= {};
-      dataByMode[modeName][collName] ??= { primitives: {}, overrides: {} };
+      const isExtended = 'variableOverrides' in coll;
 
+      // Drop "ghost" variables before processing.
+      //
+      // An extended collection inherits its parent library's *published snapshot*,
+      // which Figma keeps deleted-yet-referenced variables inside (e.g. renaming a
+      // collection's variables to add the TEDI/ group deletes the old ones, but they
+      // linger in the snapshot because overrides/aliases still reference them). So
+      // `ExtendedVariableCollection.variableIds` returns live variables AND ghosts,
+      // doubling every affected token. (A local collection lists only live variables,
+      // which is why the source file itself exports cleanly.)
+      //
+      // Primary strategy: keep a variable only if it's in the source library's live
+      // set (see liveNamesBySource) — this is prefix-agnostic, so it self-corrects if
+      // the TEDI/ group is ever added, removed, or renamed, and it also clears ghosts
+      // from the semantic collections (which are not prefixed at all). Own variables
+      // (variableCollectionId === coll.id) are always kept as a safety net.
+      //
+      // Fallback when teamLibrary is unavailable: a name-prefix heuristic that drops a
+      // non-prefixed variable when the same collection also holds the prefixed form of
+      // its stem. Only meaningful for base collections, but better than nothing.
+      const src = sourceNameByCollName[collName];
+      const liveSet = src ? liveNamesBySource.get(normCollName(src)) : undefined;
+
+      const stemOf = (kebabName: string) =>
+        kebabName.startsWith('tedi-') ? kebabName.slice('tedi-'.length) : kebabName;
+
+      const fetched: { variable: Variable; varId: string }[] = [];
+      const prefixedStems = new Set<string>();
       for (const varId of coll.variableIds) {
         const variable = await figma.variables.getVariableByIdAsync(varId);
         if (!variable) continue;
+        if (kebab(variable.name).startsWith('tedi-')) prefixedStems.add(stemOf(kebab(variable.name)));
+        fetched.push({ variable, varId });
+      }
 
-        const isOverride =
-          (coll as any).variableOverrides?.[varId]?.[mode.modeId] !== undefined;
-
-        let rawValue: VariableValue | null = null;
-        if (!isOverride) {
-          rawValue = await getFreshSourceValue(variable, mode);
+      const vars = fetched.filter(({ variable }) => {
+        if (liveSet && liveSet.size) {
+          return variable.variableCollectionId === coll.id ||
+            liveSet.has(variable.name.toLowerCase());
         }
-        if (!rawValue) {
-          const valuesByMode = await variable.valuesByModeForCollectionAsync(coll);
-          rawValue = valuesByMode[mode.modeId] ?? null;
+        const kebabName = kebab(variable.name);
+        return !(!kebabName.startsWith('tedi-') && prefixedStems.has(stemOf(kebabName)));
+      });
+
+      for (const mode of coll.modes) {
+        const modeName = mode.name.trim();
+        dataByMode[modeName] ??= {};
+        dataByMode[modeName][collName] ??= { primitives: {}, overrides: {} };
+
+        for (const { variable, varId } of vars) {
+          // Standalone collections have no variableOverrides — every value is a primitive.
+          const isOverride =
+            isExtended &&
+            (coll as any).variableOverrides?.[varId]?.[mode.modeId] !== undefined;
+
+          let rawValue: VariableValue | null = null;
+          if (isExtended && !isOverride) {
+            rawValue = await getFreshSourceValue(variable, mode);
+          }
+          if (!rawValue) {
+            const valuesByMode = isExtended
+              ? await variable.valuesByModeForCollectionAsync(coll)
+              : variable.valuesByMode;
+            rawValue = valuesByMode[mode.modeId] ?? null;
+          }
+          if (!rawValue) continue;
+
+          const resolved = await resolveValue(
+            rawValue,
+            mode.modeId,
+            true,
+            collName,
+            variable.name
+          );
+
+          if (!resolved) continue;
+
+          const target = isOverride
+            ? dataByMode[modeName][collName].overrides
+            : dataByMode[modeName][collName].primitives;
+
+          target[variable.name] = resolved;
         }
-        if (!rawValue) continue;
-
-        const resolved = await resolveValue(
-          rawValue,
-          mode.modeId,
-          true,
-          collName,
-          variable.name
-        );
-
-        if (!resolved) continue;
-
-        const target = isOverride
-          ? dataByMode[modeName][collName].overrides
-          : dataByMode[modeName][collName].primitives;
-
-        target[variable.name] = resolved;
       }
     }
   }
@@ -496,11 +578,41 @@ ${lines.join('\n')}
 
   figma.showUI(__html__, { width: 480, height: 720 });
 
+  // TEDI collections are always exported and never shown in the UI. Only the
+  // remaining ("additional") collections are offered for the user to opt into.
+  // Collections whose name starts with "_" are internal by convention and are
+  // excluded entirely — neither shown nor exported.
+  const tediCollectionNames: string[] = [];
+  const additionalCollections: { name: string }[] = [];
+  for (const coll of collections) {
+    const name = coll.name.trim();
+    if (name.startsWith('_')) continue;
+    const src = sourceNameByCollName[name];
+    if (!!src && isTediSource(src)) tediCollectionNames.push(name);
+    else additionalCollections.push({ name });
+  }
+
   figma.ui.onmessage = async msg => {
-    const themeName = msg.themeName?.trim();
-    if (!themeName) return figma.notify('Please enter a theme name', { error: true });
+    if (msg.type === 'ui-ready') {
+      return figma.ui.postMessage({ type: 'collections', collections: additionalCollections });
+    }
+
+    if (msg.type === 'cancel') return figma.closePlugin();
 
     if (msg.type === 'export-all') {
+      const themeName = msg.themeName?.trim();
+      if (!themeName) return figma.notify('Please enter a theme name', { error: true });
+
+      const additionalSelected = (msg.selected ?? [])
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      const selected = new Set<string>([...tediCollectionNames, ...additionalSelected]);
+      if (!selected.size) {
+        return figma.notify('No collections available to export', { error: true });
+      }
+
+      await collectData(selected);
+
       const files: { name:string; content:string }[] = [];
 
       const baseFile = buildBaseOverridesFile(themeName);
@@ -527,8 +639,6 @@ ${lines.join('\n')}
         themeName,
       });
     }
-
-    if (msg.type === 'cancel') figma.closePlugin();
   };
 }
 
