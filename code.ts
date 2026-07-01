@@ -292,48 +292,61 @@ async function exportVariablesToCss() {
 
       const isExtended = 'variableOverrides' in coll;
 
-      // Drop "ghost" variables before processing.
+      // De-duplicate "ghost" variables before processing.
       //
       // An extended collection inherits its parent library's *published snapshot*,
       // which Figma keeps deleted-yet-referenced variables inside (e.g. renaming a
       // collection's variables to add the TEDI/ group deletes the old ones, but they
       // linger in the snapshot because overrides/aliases still reference them). So
       // `ExtendedVariableCollection.variableIds` returns live variables AND ghosts,
-      // doubling every affected token. (A local collection lists only live variables,
-      // which is why the source file itself exports cleanly.)
+      // doubling affected tokens (`TEDI/primary-100` alongside the ghost `primary-100`).
+      // (A local collection lists only live variables, which is why the source file
+      // itself exports cleanly.)
       //
-      // Primary strategy: keep a variable only if it's in the source library's live
-      // set (see liveNamesBySource) — this is prefix-agnostic, so it self-corrects if
-      // the TEDI/ group is ever added, removed, or renamed, and it also clears ghosts
-      // from the semantic collections (which are not prefixed at all). Own variables
-      // (variableCollectionId === coll.id) are always kept as a safety net.
-      //
-      // Fallback when teamLibrary is unavailable: a name-prefix heuristic that drops a
-      // non-prefixed variable when the same collection also holds the prefixed form of
-      // its stem. Only meaningful for base collections, but better than nothing.
+      // The rule: only ever drop a variable that is an actual DUPLICATE — i.e. shares
+      // a stem with another variable in the same collection. A variable with a unique
+      // stem is kept unconditionally, because the library's live set is NOT a complete
+      // list of valid variables (variables hidden from publishing, or a library
+      // published slightly behind the file, are absent from it) — so live-set
+      // membership must never be used to delete a token outright. It only breaks ties
+      // WITHIN a duplicated stem. stemOf strips the tedi- group prefix so a prefixed
+      // and non-prefixed variant of the same token collide, which handles the TEDI
+      // group being either added or removed.
       const src = sourceNameByCollName[collName];
       const liveSet = src ? liveNamesBySource.get(normCollName(src)) : undefined;
 
       const stemOf = (kebabName: string) =>
         kebabName.startsWith('tedi-') ? kebabName.slice('tedi-'.length) : kebabName;
 
-      const fetched: { variable: Variable; varId: string }[] = [];
-      const prefixedStems = new Set<string>();
+      const byStem = new Map<string, { variable: Variable; varId: string }[]>();
       for (const varId of coll.variableIds) {
         const variable = await figma.variables.getVariableByIdAsync(varId);
         if (!variable) continue;
-        if (kebab(variable.name).startsWith('tedi-')) prefixedStems.add(stemOf(kebab(variable.name)));
-        fetched.push({ variable, varId });
+        const stem = stemOf(kebab(variable.name));
+        const group = byStem.get(stem) ?? [];
+        group.push({ variable, varId });
+        byStem.set(stem, group);
       }
 
-      const vars = fetched.filter(({ variable }) => {
-        if (liveSet && liveSet.size) {
-          return variable.variableCollectionId === coll.id ||
-            liveSet.has(variable.name.toLowerCase());
-        }
-        const kebabName = kebab(variable.name);
-        return !(!kebabName.startsWith('tedi-') && prefixedStems.has(stemOf(kebabName)));
-      });
+      const vars: { variable: Variable; varId: string }[] = [];
+      for (const group of byStem.values()) {
+        // Unique stem → not a duplicate → always keep (see note above).
+        if (group.length === 1) { vars.push(group[0]); continue; }
+
+        // Duplicated stem: prefer the live variant (in the source library's live set,
+        // or genuinely own to this collection); the others are ghosts.
+        const live = (liveSet && liveSet.size)
+          ? group.filter(({ variable }) =>
+              variable.variableCollectionId === coll.id ||
+              liveSet.has(variable.name.toLowerCase()))
+          : [];
+        if (live.length) { vars.push(...live); continue; }
+
+        // No live info: prefer the TEDI/-prefixed variant, else keep all (they
+        // collapse by output key anyway).
+        const prefixed = group.filter(({ variable }) => kebab(variable.name).startsWith('tedi-'));
+        vars.push(...(prefixed.length ? prefixed : group));
+      }
 
       for (const mode of coll.modes) {
         const modeName = mode.name.trim();
