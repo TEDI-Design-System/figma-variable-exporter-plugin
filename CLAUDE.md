@@ -39,8 +39,8 @@ Message flow: on load `ui.html` posts `{type: 'ui-ready'}` → `code.ts` replies
 
 5. **File builders** — each returns `{name, content}` or `null`:
    - `buildBaseOverridesFile` → `_base-variables__<theme>.css` — base-layer tokens, split into light/dark theme classes and desktop/tablet/mobile media queries.
-   - `buildColorSchemeFile` (per scheme) → `_color-variables__<theme>-<scheme>.css` — semantic non-dimension colors, emitted under `.tedi-theme--<theme>` / `.tedi-theme--<theme>-dark`.
-   - `buildResponsiveDimensionsFile` → `_dimensional-variables__<theme>.css` — semantic dimension tokens across breakpoints.
+   - `buildColorSchemeFile` (per scheme) → `_color-variables__<theme>-<scheme>.css` — semantic colors only (dimensions **and** fonts are excluded via `isDimensionCollection`/`isFontCollection`), emitted under `.tedi-theme--<theme>` / `.tedi-theme--<theme>-dark`.
+   - `buildResponsiveSemanticFile(theme, fileTag, matchCollection)` — one generic builder for any breakpoint-driven semantic category. Emits a default `.tedi-theme--<theme>` block plus per-breakpoint `@media` overrides; **base-mode values seed the desktop bucket** so non-responsive semantic tokens still export. Called twice: `('dimensional', isDimensionCollection)` → `_dimensional-variables__<theme>.css` and `('typography', isFontCollection)` → `_typography-variables__<theme>.css`. (Semantic fonts are breakpoint-responsive like dimensions, so they get their own responsive file rather than living in the scheme/base files.)
    - An `index.css` is generated last, `@import`-ing every produced file.
 
 ### Conventions

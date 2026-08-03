@@ -14,6 +14,11 @@ async function exportVariablesToCss() {
   const includesAny = (source: string, arr: string[]) =>
     arr.some(k => source.includes(k));
 
+  // Strip the leading `tedi-` group prefix so a prefixed and non-prefixed variant
+  // of the same token share a stem (see the ghost-filter note in collectData).
+  const stemOf = (kebabName: string) =>
+    kebabName.startsWith('tedi-') ? kebabName.slice('tedi-'.length) : kebabName;
+
   const NAME_NUMBER_KEYWORDS = ['weight','opacity','z-index','flex','ratio','scale'];
   const COLL_TYPO_KEYWORDS = ['font','typography','text'];
   const NAME_TYPO_KEYWORDS = ['font-size','line-height','letter-spacing'];
@@ -68,7 +73,7 @@ async function exportVariablesToCss() {
     if (isVariableAlias(raw)) {
       const target = await figma.variables.getVariableByIdAsync(raw.id);
       if (!target) return null;
-      if (preserveAlias) return `var(--${kebab(target.name)})`;
+      if (preserveAlias) return `var(--${await canonicalAliasName(target)})`;
 
       return resolveValue(
         target.valuesByMode[modeId] ?? null,
@@ -113,7 +118,11 @@ async function exportVariablesToCss() {
     return null;
   }
 
-  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  // Only export collections that live in this file. Extended collections are
+  // still local (remote === false); genuine remote/library collections are
+  // skipped so we never emit tokens the file doesn't actually own.
+  const collections = (await figma.variables.getLocalVariableCollectionsAsync())
+    .filter(coll => coll.remote === false);
 
   const TEDI_SOURCE_NAMES = [
     'TEDI colors base',
@@ -137,6 +146,8 @@ async function exportVariablesToCss() {
     /\bsemantic$/.test(normCollName(name));
   const isTediDimensionsSource = (name: string) =>
     normCollName(name).includes('dimensions');
+  const isTediFontsSource = (name: string) =>
+    /\bfonts?\b/.test(normCollName(name));
 
   const libraryVarSources = new Map<string, string>();
   // Lower-cased set of the CURRENT (live) variable names for each TEDI source
@@ -162,6 +173,69 @@ async function exportVariablesToCss() {
     }
   } catch (_e) {
     // teamLibrary unavailable (e.g., permission missing) — fall through to alias-voting.
+  }
+
+  // Index each TEDI source's live variable names by stem, so an alias that points
+  // at a "ghost" (a deleted-yet-referenced variable Figma keeps in the published
+  // snapshot) can be rewritten to its live equivalent. Prefer the `tedi-`-prefixed
+  // variant — the current canonical name after tokens moved into the TEDI/ group.
+  const liveNameByStemBySource = new Map<string, Map<string, string>>();
+  for (const [srcKey, liveSet] of liveNamesBySource) {
+    const stemMap = new Map<string, string>();
+    for (const rawLower of liveSet) {
+      const k = kebab(rawLower);
+      const stem = stemOf(k);
+      const existing = stemMap.get(stem);
+      if (!existing || (k.startsWith('tedi-') && !existing.startsWith('tedi-'))) {
+        stemMap.set(stem, k);
+      }
+    }
+    liveNameByStemBySource.set(srcKey, stemMap);
+  }
+
+  // Resolve the CSS custom-property name an alias should reference. Normally this is
+  // just kebab(target.name) — but when the alias targets a ghost (e.g. the pre-rename
+  // `radius/08` left behind when radius tokens moved into the TEDI/ group), that stale
+  // name emits a dangling `var(--radius-08)`. If the target's source collection has a
+  // live variable with the same stem, emit that instead (`var(--tedi-radius-08)`).
+  const warnedGhostAliases = new Set<string>();
+  async function canonicalAliasName(target: Variable): Promise<string> {
+    const targetKebab = kebab(target.name);
+    // Only remote (library) targets can be ghosts; local targets are always valid,
+    // including aliases to a file's own semantic tokens (e.g. --card-radius-rounded).
+    if (!target.remote) return targetKebab;
+
+    const targetColl = await figma.variables.getVariableCollectionByIdAsync(
+      target.variableCollectionId
+    );
+    if (!targetColl) return targetKebab;
+
+    const srcKey = normCollName(targetColl.name);
+    const liveSet = liveNamesBySource.get(srcKey);
+    // No live info (teamLibrary unavailable, or a non-TEDI source) → keep verbatim.
+    if (!liveSet || !liveSet.size) return targetKebab;
+    // Target is itself live → nothing to canonicalize.
+    if (liveSet.has(target.name.toLowerCase())) return targetKebab;
+
+    // Ghost target: remap to the live variant sharing its stem, if one exists.
+    const live = liveNameByStemBySource.get(srcKey)?.get(stemOf(targetKebab));
+    if (live && live !== targetKebab) {
+      if (!warnedGhostAliases.has(targetKebab)) {
+        warnedGhostAliases.add(targetKebab);
+        console.warn(
+          `[export] alias targets ghost "${target.name}" — remapped var(--${targetKebab}) → var(--${live})`
+        );
+      }
+      return live;
+    }
+
+    if (!warnedGhostAliases.has(targetKebab)) {
+      warnedGhostAliases.add(targetKebab);
+      console.warn(
+        `[export] alias targets ghost "${target.name}" with no live equivalent — var(--${targetKebab}) will be undefined`
+      );
+    }
+    return targetKebab;
   }
 
   // For collections that don't map to a known TEDI source (e.g. a project's own
@@ -315,9 +389,6 @@ async function exportVariablesToCss() {
       const src = sourceNameByCollName[collName];
       const liveSet = src ? liveNamesBySource.get(normCollName(src)) : undefined;
 
-      const stemOf = (kebabName: string) =>
-        kebabName.startsWith('tedi-') ? kebabName.slice('tedi-'.length) : kebabName;
-
       const byStem = new Map<string, { variable: Variable; varId: string }[]>();
       for (const varId of coll.variableIds) {
         const variable = await figma.variables.getVariableByIdAsync(varId);
@@ -396,6 +467,11 @@ async function exportVariablesToCss() {
     return src ? isTediDimensionsSource(src) : false;
   };
 
+  const isFontCollection = (collName: string) => {
+    const src = sourceNameByCollName[collName];
+    return src ? isTediFontsSource(src) : false;
+  };
+
   const isSemanticCollection = (collName: string) => {
     const src = sourceNameByCollName[collName];
     return src ? isTediSemanticLayer(src) : false;
@@ -410,6 +486,7 @@ async function exportVariablesToCss() {
       for (const [collName, group] of Object.entries(collections)) {
         if (!isSemanticCollection(collName)) continue;
         if (isDimensionCollection(collName)) continue;
+        if (isFontCollection(collName)) continue;
         Object.entries(group.primitives).forEach(([k,v]) => vars.set(k,v));
         Object.entries(group.overrides).forEach(([k,v]) => vars.set(k,v));
       }
@@ -421,6 +498,7 @@ async function exportVariablesToCss() {
       for (const [collName, group] of Object.entries(collections)) {
         if (!isSemanticCollection(collName)) continue;
         if (isDimensionCollection(collName)) continue;
+        if (isFontCollection(collName)) continue;
         Object.entries(group.primitives).forEach(([k,v]) => vars.set(k,v));
         Object.entries(group.overrides).forEach(([k,v]) => vars.set(k,v));
       }
@@ -533,58 +611,70 @@ ${lines.join('\n')}
     };
   };
 
-  const buildResponsiveDimensionsFile = (theme: string) => {
-    const buckets: Record<ModeBucket, string[]> = {
-      desktop: [],
-      tablet: [],
-      mobile: [],
+  // Emits a responsive semantic file for one category (dimensions or fonts): a
+  // default `.tedi-theme--<theme>` block plus per-breakpoint @media overrides.
+  // Both categories are breakpoint-driven, so they share this builder — only the
+  // collection predicate and file tag differ. Base-mode values seed the desktop
+  // bucket so non-responsive semantic tokens still export.
+  const buildResponsiveSemanticFile = (
+    theme: string,
+    fileTag: string,
+    matchCollection: (collName: string) => boolean
+  ) => {
+    const maps: Record<ModeBucket, Map<string,string>> = {
+      desktop: new Map(),
+      tablet: new Map(),
+      mobile: new Map(),
     };
 
-    for (const [modeName, collections] of Object.entries(dataByMode)) {
-      const bucket = modeToBucket(modeName);
-      if (!bucket) continue;
+    const merge = (
+      target: Map<string,string>,
+      group: { primitives: Record<string,string>; overrides: Record<string,string> }
+    ) => {
+      Object.entries(group.primitives).forEach(([k,v]) => target.set(k,v));
+      Object.entries(group.overrides).forEach(([k,v]) => target.set(k,v));
+    };
 
-      for (const [collName, group] of Object.entries(collections)) {
-        if (!isSemanticCollection(collName)) continue;
-        if (!isDimensionCollection(collName)) continue;
-
-        Object.entries(group.primitives).forEach(([k,v]) => {
-          buckets[bucket].push(`    --${kebab(k)}: ${v};`);
-        });
+    const collect = (want: (modeName: string) => boolean, into: ModeBucket) => {
+      for (const [modeName, collections] of Object.entries(dataByMode)) {
+        if (!want(modeName)) continue;
+        for (const [collName, group] of Object.entries(collections)) {
+          if (!isSemanticCollection(collName) || !matchCollection(collName)) continue;
+          merge(maps[into], group);
+        }
       }
+    };
 
-      for (const [collName, group] of Object.entries(collections)) {
-        if (!isSemanticCollection(collName)) continue;
-        if (!isDimensionCollection(collName)) continue;
+    collect(isBaseMode, 'desktop');
+    (['desktop','tablet','mobile'] as ModeBucket[]).forEach(bucket =>
+      collect(modeName => modeToBucket(modeName) === bucket, bucket));
 
-        Object.entries(group.overrides).forEach(([k,v]) => {
-          buckets[bucket].push(`    --${kebab(k)}: ${v};`);
-        });
-      }
-    }
+    if (!maps.desktop.size) return null;
 
-    if (!buckets.desktop.length) return null;
+    const themeKebab = kebab(theme);
+    const toLines = (m: Map<string,string>, indent: string) =>
+      Array.from(m.entries()).map(([k,v]) => `${indent}--${kebab(k)}: ${v};`);
 
-    let css =
-      `.tedi-theme--${kebab(theme)} {
-      ${buckets.desktop.map(l => l.replace('    ', '  ')).join('\n')}
-      }
-      `;
+    let css = `.tedi-theme--${themeKebab} {
+${toLines(maps.desktop, '  ').join('\n')}
+}
+`;
 
     (['tablet','mobile'] as ModeBucket[]).forEach(bucket => {
       const media = MEDIA_QUERIES[bucket];
-      if (!media || !buckets[bucket].length) return;
+      if (!media || !maps[bucket].size) return;
 
       css += `
-        @media ${media} {
-          .tedi-theme--${kebab(theme)} {
-        ${buckets[bucket].join('\n')}
-          }
-        }`;
+@media ${media} {
+  .tedi-theme--${themeKebab} {
+${toLines(maps[bucket], '    ').join('\n')}
+  }
+}
+`;
     });
 
     return {
-      name: `_dimensional-variables__${kebab(theme)}.css`,
+      name: `_${fileTag}-variables__${themeKebab}.css`,
       content: css,
     };
   };
@@ -636,8 +726,11 @@ ${lines.join('\n')}
         if (lines.length) files.push(buildColorSchemeFile(themeName, scheme, lines));
       });
 
-      const dimFile = buildResponsiveDimensionsFile(themeName);
+      const dimFile = buildResponsiveSemanticFile(themeName, 'dimensional', isDimensionCollection);
       if (dimFile) files.push(dimFile);
+
+      const typographyFile = buildResponsiveSemanticFile(themeName, 'typography', isFontCollection);
+      if (typographyFile) files.push(typographyFile);
 
       files.push({
         name: 'index.css',
